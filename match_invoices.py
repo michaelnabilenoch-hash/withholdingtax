@@ -253,6 +253,10 @@ def find_best_match(tax_row, sales_df, used_invoices):
         if not cand_with_reg.empty:
             cand = cand_with_reg.copy()  # نستخدم فقط الفواتير بنفس رقم التسجيل
     
+    # لو بعد التصفية بقيش حاجة
+    if cand.empty:
+        return None
+
     cand["token_score"] = cand["tokens"].apply(lambda t: len(t & tax_row["tokens"]))
     cand["fuzzy"] = cand["name_norm"].apply(lambda s: fuzzy(s, tax_row["name_norm"]))
     cand = cand[(cand["token_score"] >= 1) | (cand["fuzzy"] >= 0.70)]
@@ -276,6 +280,17 @@ def find_best_match(tax_row, sales_df, used_invoices):
         by=["reg_match", "value_dist", "token_score", "fuzzy"], 
         ascending=[False, True, False, False]  # رقم التسجيل له الأولوية
     )
+
+    # 🆕 (1) تجميع كل فواتير نفس رقم التسجيل في الفترة
+    # إذا كان في رقم تسجيل، نجرب الأول: هل مجموع كل الفواتير المرشحة ≈ مبلغ الخصم؟
+    if tax_reg and not cand.empty:
+        total_reg = cand["net_amount"].sum()
+        if within_absolute(total_reg, 5.0) or within_pct(total_reg):
+            invs = cand[COL_INV].astype(str).tolist()
+            years = cand["year"].astype(str).tolist()
+            dates = cand["pos_date"].astype(str).tolist()
+            has_ret = cand["has_return"].any()
+            return invs, years, dates, float(total_reg), has_ret
     
     # 1. فاتورة واحدة متطابقة (≤5 جنيه)
     for _, r in cand.head(100).iterrows():
@@ -302,9 +317,11 @@ def find_best_match(tax_row, sales_df, used_invoices):
     # 3. مجموع 2 فواتير
     for combo in combinations(cand.head(60).itertuples(index=False), 2):
         total = sum(r.net_amount for r in combo)
-        if not (within_absolute(total, 5.0) or within_pct(total)): continue
+        if not (within_absolute(total, 5.0) or within_pct(total)): 
+            continue
         invs = [str(r._asdict()[COL_INV]) for r in combo]
-        if len(set(invs)) != len(invs): continue
+        if len(set(invs)) != len(invs): 
+            continue
         years = [str(r.year) for r in combo]
         dates = [str(r.pos_date) for r in combo]
         ret = any(r.has_return for r in combo)
@@ -313,17 +330,20 @@ def find_best_match(tax_row, sales_df, used_invoices):
     # 4. مجموع 3 فواتير
     for combo in combinations(cand.head(60).itertuples(index=False), 3):
         total = sum(r.net_amount for r in combo)
-        if not within_pct(total): continue
+        if not within_pct(total): 
+            continue
         invs = [str(r._asdict()[COL_INV]) for r in combo]
-        if len(set(invs)) != len(invs): continue
+        if len(set(invs)) != len(invs): 
+            continue
         years = [str(r.year) for r in combo]
         dates = [str(r.pos_date) for r in combo]
         ret = any(r.has_return for r in combo)
         return invs, years, dates, float(total), ret
     
-    # 5. بحث موسع للمبالغ الكبيرة
-    if max(targets) >= 50000:
-        ext = extended_subset_search(cand, targets)
+    # 🆕 (2) بحث موسّع للمجموعات الأكبر من 3 فواتير
+    # بدون شرط مبلغ 50,000 – لكن مع التحكم في عدد الفواتير لتقليل التعقيد
+    if len(cand) <= 15:  # تقدر تزود/تقلل الرقم حسب حجم الداتا
+        ext = extended_subset_search(cand, targets, max_invoices=50, max_nodes=200000)
         if ext:
             total = sum(r.net_amount for r in ext)
             if within_pct(total):
@@ -454,7 +474,7 @@ with st.expander("📖 كيفية الاستخدام", expanded=True):
     ### 🆕 ميزة جديدة: رقم التسجيل الضريبي
     - إذا كان ملف المبيعات وكشف الخصم يحتويان على عمود **"رقم التسجيل"**
     - البرنامج سيعطي **أولوية قصوى** للفواتير بنفس رقم التسجيل
-    - هذا يحسّن الدقة بشكل كبير ويتجنب الأخطاء
+    - كما سيجرب أولاً تجميع كل فواتير نفس الرقم في الفترة للوصول لقيمة كشف الخصم
     """)
 
 col1, col2 = st.columns(2)

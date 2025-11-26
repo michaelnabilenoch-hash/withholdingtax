@@ -7,7 +7,7 @@ import streamlit as st
 from difflib import SequenceMatcher
 
 # ============================================================
-# إعدادات الأعمدة (قابلة للتعديل من الواجهة)
+# إعدادات الأعمدة
 # ============================================================
 COL_INV = "فواتير"
 COL_DATE = "التاريخ"
@@ -29,29 +29,28 @@ NEW_COLS = [
 ]
 
 # ============================================================
-# STOPWORDS & WORD_MAP
+# WORD_MAP & STOPWORDS
 # ============================================================
+WORD_MAP = {
+    "المياه": "مياه", "المياة": "مياه", "مياة": "مياه", "الماء": "مياه",
+    "الصرف": "صرف", "الصرف الصحي": "صرف صحي", "صرف الصحي": "صرف صحي",
+    "الشرب": "شرب", "الشراب": "شرب",
+    "بسوهج": "بسوهاج", "بسوهـاج": "بسوهاج", "سوهاج": "بسوهاج",
+    "الزراعى": "زراعي", "الزراعي": "زراعي", "زراعية": "زراعي",
+    "للاستثمار": "استثمار", "استثمارية": "استثمار",
+    "للمقاولات": "مقاولات", "المقاولات": "مقاولات",
+    "للصناعات": "صناعات", "الصناعات": "صناعات",
+    "للتوريدات": "توريدات", "توريد": "توريدات",
+    "الغذائية": "غذائية", "اغذية": "غذائية", "اغذيه": "غذائية",
+}
+
 STOPWORDS = {
     "شركة", "الشركة", "شركه", "الشركه",
     "وال", "بال", "لل", "ل", "و",
-    "مصر", "القاهرة", "مصرية", "المصرية",
+    "مصر", "القاهرة", "مصرية",
     "العالمية", "الدولية", "الجديدة",
-    "مصنع", "الصناعات", "صناعية",
-    "للتجارة", "تجارية", "تجاره",
-    "جروب", "مجموعة", "للصناعات",
-    "الغذائية", "الاغذية", "اغذية", "غذائية",
-    "والصناعات", "للمقاولات", "مقاولات",
-}
-
-WORD_MAP = {
-    "المياه": "مياه", "المياة": "مياه", "مياة": "مياه",
-    "الصرف": "صرف", "الصرف الصحي": "صرف صحي",
-    "الشرب": "شرب",
-    "بسوهج": "بسوهاج", "بسوهـاج": "بسوهاج",
-    "الزراعى": "زراعي", "الزراعي": "زراعي",
-    "للاستثمار": "استثمار", "استثمارية": "استثمار",
-    "للتوريدات": "توريدات", "توريد": "توريدات",
-    "الغذائيه": "غذائية", "اغذيه": "غذائية",
+    "مصنع", "صناعية", "تجارية",
+    "جروب", "مجموعة",
 }
 
 def normalize_letters(text):
@@ -89,11 +88,9 @@ def fuzzy(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
 def to_num(v):
-    """تحويل القيمة لرقم - يتعامل مع # و NaN"""
     if pd.isna(v): return np.nan
     s = str(v).strip()
-    # لو القيمة ###، نرجع NaN
-    if s.startswith("#") or not s: return np.nan
+    if not s or s.startswith("#"): return np.nan
     try:
         return float(s.replace(",", ""))
     except:
@@ -104,28 +101,11 @@ def parse_dates(series, dayfirst):
     return dt, dt.dt.year.fillna(0).astype(int), dt.dt.month.fillna(0).astype(int)
 
 # ============================================================
-# تجهيز الملفات - مع تشخيص الأخطاء
+# تجهيز الملفات - مع الإصلاح الحرج
 # ============================================================
 def prepare_sales(df_raw):
-    st.write(f"🔍 أعمدة ملف المبيعات: {list(df_raw.columns)}")
-    
-    # فحص وجود الأعمدة المطلوبة
-    missing = []
-    for col in [COL_INV, COL_DATE, COL_NAME, COL_AMOUNT]:
-        if col not in df_raw.columns:
-            missing.append(col)
-    
-    if missing:
-        st.error(f"❌ الأعمدة التالية مفقودة من ملف المبيعات: {missing}")
-        st.info(f"الأعمدة الموجودة: {list(df_raw.columns)}")
-        st.stop()
-    
     df = df_raw.copy()
     df["amt"] = df[COL_AMOUNT].apply(to_num)
-    
-    # عرض عينة من البيانات
-    valid_amounts = df["amt"].notna().sum()
-    st.info(f"✅ تم تحويل {valid_amounts:,} قيمة صحيحة من أصل {len(df):,}")
     
     grouped = df.groupby(COL_INV).agg(
         net_amount=("amt", "sum"),
@@ -140,38 +120,19 @@ def prepare_sales(df_raw):
     
     grouped = grouped[grouped["net_amount"] > 0]
     
-    # 🔥 التاريخ في ملف المبيعات بصيغة dd/mm/yyyy
+    # 🔥 الإصلاح الحرج: التاريخ بصيغة dd/mm/yyyy
     grouped["date_parsed"], grouped["year"], grouped["month"] = parse_dates(
-        grouped["pos_date"], dayfirst=True  # ✅ صح!
+        grouped["pos_date"], dayfirst=True  # ✅ تم تصحيحه!
     )
-    
-    st.info(f"✅ تم تجهيز {len(grouped):,} فاتورة من المبيعات")
     
     grouped["name_norm"] = grouped["name"].apply(normalize_name)
     grouped["tokens"] = grouped["name"].apply(tokenize)
     return grouped
 
 def prepare_tax(df_raw):
-    st.write(f"🔍 أعمدة كشف الخصم: {list(df_raw.columns)}")
-    
-    # فحص وجود الأعمدة
-    missing = []
-    for col in [COL_TAX_NAME, COL_TAX_AMOUNT, COL_TAX_TAXED, COL_TAX_RATE, COL_TAX_DATE]:
-        if col not in df_raw.columns:
-            missing.append(col)
-    
-    if missing:
-        st.error(f"❌ الأعمدة التالية مفقودة من كشف الخصم: {missing}")
-        st.info(f"الأعمدة الموجودة: {list(df_raw.columns)}")
-        st.stop()
-    
     df = df_raw.copy()
     df["v_file"] = df[COL_TAX_AMOUNT].apply(to_num)
     df["v_tax_paid"] = df[COL_TAX_TAXED].apply(to_num)
-    
-    # عرض إحصائيات
-    valid_amounts = df["v_file"].notna().sum()
-    st.info(f"✅ قيم صحيحة: {valid_amounts:,} من {len(df):,}")
     
     def rate_to_float(x):
         try:
@@ -187,11 +148,9 @@ def prepare_tax(df_raw):
         axis=1
     )
     df["v_mix"] = df[["v_file", "v_tax"]].mean(axis=1, skipna=True)
-    
     df["date_parsed"], df["year"], df["month"] = parse_dates(
         df[COL_TAX_DATE], dayfirst=True
     )
-    
     df["name_norm"] = df[COL_TAX_NAME].apply(normalize_name)
     df["tokens"] = df[COL_TAX_NAME].apply(tokenize)
     return df
@@ -203,7 +162,7 @@ def filter_year_and_date(sales_df, tax_date, tax_year, tax_month):
     if tax_year == 0 or pd.isna(tax_date):
         return sales_df.iloc[0:0]
     
-    # بحث في 3 سنوات
+    # بحث موسع في 3 سنوات
     allowed_years = [tax_year, tax_year - 1, tax_year - 2]
     mask_year = sales_df["year"].isin(allowed_years)
     mask_date = (sales_df["date_parsed"] <= tax_date)
@@ -266,7 +225,7 @@ def find_best_match(tax_row, sales_df, used_invoices):
     
     cand["token_score"] = cand["tokens"].apply(lambda t: len(t & tax_row["tokens"]))
     cand["fuzzy"] = cand["name_norm"].apply(lambda s: fuzzy(s, tax_row["name_norm"]))
-    cand = cand[(cand["token_score"] >= 1) | (cand["fuzzy"] >= 0.7)]
+    cand = cand[(cand["token_score"] >= 1) | (cand["fuzzy"] >= 0.70)]
     
     if cand.empty: return None
     
@@ -284,7 +243,7 @@ def find_best_match(tax_row, sales_df, used_invoices):
         ascending=[True, False, False]
     )
     
-    # 1. فاتورة واحدة متطابقة تماماً (≤5 جنيه)
+    # 1. فاتورة واحدة متطابقة (≤5 جنيه)
     for _, r in cand.head(100).iterrows():
         if within_absolute(r["net_amount"], max_diff=5.0):
             return (
@@ -328,7 +287,7 @@ def find_best_match(tax_row, sales_df, used_invoices):
         ret = any(r.has_return for r in combo)
         return invs, years, dates, float(total), ret
     
-    # 5. بحث موسع
+    # 5. بحث موسع للمبالغ الكبيرة
     if max(targets) >= 50000:
         ext = extended_subset_search(cand, targets)
         if ext:
@@ -342,22 +301,86 @@ def find_best_match(tax_row, sales_df, used_invoices):
     
     return None
 
-def match_all(sales_df, tax_df):
+def match_all_basic(sales_df, tax_df):
     used = set()
     result = tax_df.copy()
     for col in NEW_COLS:
         result[col] = ""
     
     matched = 0
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    total = len(result)
     for idx, row in result.iterrows():
-        # تحديث شريط التقدم
-        progress = (idx + 1) / total
-        progress_bar.progress(progress)
-        status_text.text(f"⏳ جاري المطابقة: {idx + 1}/{total}")
+        res = find_best_match(row, sales_df, used)
+        if res:
+            invs, years, dates, amt, has_ret = res
+            result.at[idx, NEW_COLS[0]] = " + ".join(invs)
+            result.at[idx, NEW_COLS[1]] = " + ".join(years)
+            result.at[idx, NEW_COLS[2]] = " + ".join(dates)
+            result.at[idx, NEW_COLS[3]] = amt
+            result.at[idx, NEW_COLS[4]] = "له مرتجع" if has_ret else ""
+            used.update(invs)
+            matched += 1
+    
+    return result, matched, len(result) - matched
+
+# ============================================================
+# المطابقة النهائية مع التعديلات
+# ============================================================
+def match_with_user_feedback(sales_df_original, tax_df_original, matches_edited, stopwords_edited):
+    global STOPWORDS
+    
+    # تحديث STOPWORDS
+    if "كلمة" in stopwords_edited.columns:
+        words = [str(v).strip() for v in stopwords_edited["كلمة"].tolist() if str(v).strip()]
+        STOPWORDS = set(words)
+    
+    # إعادة تجهيز tokens
+    sales_df = sales_df_original.copy()
+    tax_df = tax_df_original.copy()
+    
+    sales_df["name_norm"] = sales_df["name"].apply(normalize_name)
+    sales_df["tokens"] = sales_df["name"].apply(tokenize)
+    
+    tax_df["name_norm"] = tax_df[COL_TAX_NAME].apply(normalize_name)
+    tax_df["tokens"] = tax_df[COL_TAX_NAME].apply(tokenize)
+    
+    result = tax_df.copy()
+    for col in NEW_COLS:
+        result[col] = ""
+    
+    used = set()
+    
+    # تثبيت التطابقات المعتمدة
+    if matches_edited is not None and not matches_edited.empty and "row_id" in matches_edited.columns:
+        for _, r in matches_edited.iterrows():
+            if "اعتماد_التطابق" in matches_edited.columns:
+                if not bool(r.get("اعتماد_التطابق", True)):
+                    continue
+            
+            row_id = int(r["row_id"])
+            inv_str = str(r[NEW_COLS[0]]).strip()
+            if not inv_str:
+                continue
+            
+            invs = [x.strip() for x in inv_str.split("+") if x.strip()]
+            years = str(r.get(NEW_COLS[1], "")).split("+")
+            dates = str(r.get(NEW_COLS[2], "")).split("+")
+            amt = r.get(NEW_COLS[3], np.nan)
+            note = r.get(NEW_COLS[4], "")
+            
+            result.at[row_id, NEW_COLS[0]] = " + ".join(invs)
+            result.at[row_id, NEW_COLS[1]] = " + ".join([y.strip() for y in years])
+            result.at[row_id, NEW_COLS[2]] = " + ".join([d.strip() for d in dates])
+            result.at[row_id, NEW_COLS[3]] = amt
+            result.at[row_id, NEW_COLS[4]] = note
+            
+            used.update(invs)
+    
+    # إكمال الباقي
+    matched = 0
+    for idx, row in result.iterrows():
+        if str(result.at[idx, NEW_COLS[0]]).strip():
+            matched += 1
+            continue
         
         res = find_best_match(row, sales_df, used)
         if res:
@@ -370,9 +393,6 @@ def match_all(sales_df, tax_df):
             used.update(invs)
             matched += 1
     
-    progress_bar.empty()
-    status_text.empty()
-    
     return result, matched, len(result) - matched
 
 # ============================================================
@@ -380,16 +400,22 @@ def match_all(sales_df, tax_df):
 # ============================================================
 st.set_page_config(page_title="مطابقة خصم المنبع", layout="wide")
 
-st.title("🎯 مطابقة خصم المنبع - الإصدار المُحسّن")
+st.title("🎯 مطابقة خصم المنبع - نظام الخطوتين المحسّن")
 st.markdown("---")
 
-with st.expander("📖 ملاحظات مهمة", expanded=True):
+with st.expander("📖 كيفية الاستخدام", expanded=True):
     st.markdown("""
-    **⚠️ تأكد من:**
-    1. ملف المبيعات يحتوي على الأعمدة: `فواتير`, `التاريخ`, `اسم الشركة`, `صافى المبيعات`
-    2. كشف الخصم يحتوي على: `اسم الجهة`, `القيمة الصافية للتعامل`, `محصل لحساب الضريبه`, `نسبة الخصم`, `تاريخ التعامل`
-    3. الأعمدة الرقمية **لا تحتوي على #** (افتح الملف في Excel وعرّض الأعمدة)
-    4. التواريخ بصيغة واضحة (مثال: 27/09/2018)
+    ### الخطوة 1️⃣: المطابقة المبدئية
+    - حمّل ملف المبيعات وكشف الخصم
+    - اضغط "مطابقة مبدئية"
+    - ستظهر لك جداول للمراجعة:
+      * جدول التطابقات (يمكنك حذف الخاطئة أو إلغاء اعتمادها)
+      * جدول STOPWORDS (الكلمات المستبعدة)
+    
+    ### الخطوة 2️⃣: المطابقة النهائية
+    - راجع الجداول وعدّل فيها
+    - اضغط "متابعة المطابقة النهائية"
+    - البرنامج يثبت التطابقات المعتمدة ويكمل الباقي
     """)
 
 col1, col2 = st.columns(2)
@@ -400,71 +426,136 @@ with col2:
 
 st.markdown("---")
 
-if st.button("🚀 ابدأ المطابقة", type="primary", use_container_width=True):
+# الخطوة 1
+if st.button("🚀 الخطوة 1: مطابقة مبدئية", use_container_width=True, type="primary"):
     if not sales_file or not tax_file:
         st.error("⚠️ ارفع الملفين أولاً!")
         st.stop()
     
     try:
-        st.markdown("### 📂 قراءة الملفات")
-        sales_raw = pd.read_csv(sales_file, encoding="utf-8-sig", dtype=str)
-        tax_raw = pd.read_csv(tax_file, encoding="utf-8-sig", dtype=str)
+        with st.spinner("⏳ جاري المعالجة..."):
+            sales_raw = pd.read_csv(sales_file, encoding="utf-8-sig", dtype=str)
+            tax_raw = pd.read_csv(tax_file, encoding="utf-8-sig", dtype=str)
+            
+            sales_prepared = prepare_sales(sales_raw)
+            tax_prepared = prepare_tax(tax_raw)
+            
+            draft_df, ok, bad = match_all_basic(sales_prepared, tax_prepared)
         
-        st.success(f"✅ تم قراءة {len(sales_raw):,} صف مبيعات و {len(tax_raw):,} صف خصم")
+        st.session_state["sales_prepared"] = sales_prepared
+        st.session_state["tax_prepared"] = tax_prepared
         
-        st.markdown("### 🔄 تجهيز البيانات")
-        sales_prepared = prepare_sales(sales_raw)
-        tax_prepared = prepare_tax(tax_raw)
+        draft_df = draft_df.copy()
+        draft_df.insert(0, "row_id", draft_df.index.astype(int))
+        st.session_state["draft_df"] = draft_df
         
-        st.markdown("### 🎯 بدء المطابقة")
-        final_df, ok, bad = match_all(sales_prepared, tax_prepared)
+        matches_only = draft_df[draft_df[NEW_COLS[0]] != ""].copy()
+        matches_only["اعتماد_التطابق"] = True
+        st.session_state["matches_table"] = matches_only
         
-        st.success("🎉 تمت المطابقة بنجاح!")
+        stopwords_df = pd.DataFrame({"كلمة": sorted(STOPWORDS)})
+        st.session_state["stopwords_table"] = stopwords_df
         
         success_rate = (ok/(ok+bad)*100) if (ok+bad) > 0 else 0
+        st.success(f"✅ المطابقة المبدئية: {ok:,} مطابق ({success_rate:.1f}%) | {bad:,} غير مطابق")
+        st.info("⬇ انزل للأسفل لمراجعة الجداول")
         
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("✅ المطابق", f"{ok:,}", delta=f"{success_rate:.1f}%")
-        with col2:
-            st.metric("❌ غير المطابق", f"{bad:,}")
-        with col3:
-            st.metric("📈 نسبة النجاح", f"{success_rate:.2f}%")
-        
-        st.markdown("---")
-        st.markdown("### 📥 تحميل النتائج")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            output = io.BytesIO()
-            final_df.to_csv(output, index=False, encoding="utf-8-sig")
-            st.download_button(
-                "📥 تحميل الكشف الكامل",
-                data=output.getvalue(),
-                file_name="كشف_مطابق.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-        
-        with col2:
-            unmatched = final_df[final_df[NEW_COLS[0]] == ""]
-            if not unmatched.empty:
-                out2 = io.BytesIO()
-                unmatched.to_csv(out2, index=False, encoding="utf-8-sig")
+    except Exception as e:
+        st.error(f"❌ خطأ: {str(e)}")
+        st.exception(e)
+
+st.markdown("---")
+
+# عرض الجداول
+if "draft_df" in st.session_state:
+    st.subheader("🧾 جدول التطابقات المبدئية")
+    matches_df = st.session_state.get("matches_table", pd.DataFrame())
+    
+    if not matches_df.empty:
+        edited_matches = st.data_editor(
+            matches_df,
+            key="matches_editor",
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "اعتماد_التطابق": st.column_config.CheckboxColumn(
+                    "اعتماد التطابق",
+                    help="ألغِ الاختيار لرفض هذا التطابق",
+                    default=True,
+                )
+            }
+        )
+    
+    st.subheader("🧹 كلمات STOPWORDS المستبعدة")
+    stopwords_df = st.session_state.get("stopwords_table", pd.DataFrame())
+    edited_stopwords = st.data_editor(
+        stopwords_df,
+        key="stopwords_editor",
+        num_rows="dynamic",
+        use_container_width=True
+    )
+    
+    st.markdown("---")
+    
+    # الخطوة 2
+    if st.button("✅ الخطوة 2: المطابقة النهائية", use_container_width=True, type="primary"):
+        try:
+            sales_prepared = st.session_state["sales_prepared"]
+            tax_prepared = st.session_state["tax_prepared"]
+            
+            with st.spinner("🔁 جاري المطابقة النهائية..."):
+                final_df, ok2, bad2 = match_with_user_feedback(
+                    sales_prepared,
+                    tax_prepared,
+                    edited_matches if 'edited_matches' in locals() else matches_df,
+                    edited_stopwords if 'edited_stopwords' in locals() else stopwords_df,
+                )
+            
+            success_rate = (ok2/(ok2+bad2)*100) if (ok2+bad2) > 0 else 0
+            
+            st.success("🎉 تمت المطابقة النهائية!")
+            
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("✅ المطابق", f"{ok2:,}", delta=f"{success_rate:.1f}%")
+            with c2:
+                st.metric("❌ غير المطابق", f"{bad2:,}")
+            with c3:
+                st.metric("📈 النجاح", f"{success_rate:.2f}%")
+            
+            st.markdown("---")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                out = io.BytesIO()
+                final_df.to_csv(out, index=False, encoding="utf-8-sig")
                 st.download_button(
-                    "📥 تحميل غير المطابق",
-                    data=out2.getvalue(),
-                    file_name="غير_مطابق.csv",
+                    "📥 تحميل الكشف الكامل",
+                    data=out.getvalue(),
+                    file_name="كشف_مطابق_نهائي.csv",
                     mime="text/csv",
                     use_container_width=True
                 )
-        
-        st.markdown("### 👀 معاينة النتائج")
-        st.dataframe(final_df.head(20), use_container_width=True)
-        
-    except Exception as e:
-        st.error(f"❌ حدث خطأ: {str(e)}")
-        st.exception(e)
+            
+            with col2:
+                unmatched = final_df[final_df[NEW_COLS[0]] == ""]
+                if not unmatched.empty:
+                    out2 = io.BytesIO()
+                    unmatched.to_csv(out2, index=False, encoding="utf-8-sig")
+                    st.download_button(
+                        "📥 تحميل غير المطابق",
+                        data=out2.getvalue(),
+                        file_name="غير_مطابق.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+            
+            st.markdown("### 👀 معاينة النتائج")
+            st.dataframe(final_df.head(20), use_container_width=True)
+            
+        except Exception as e:
+            st.error(f"❌ خطأ: {str(e)}")
+            st.exception(e)
 
 st.markdown("---")
 st.caption("💼 محاسب قانوني: مايكل نبيل | 🚀 2025")

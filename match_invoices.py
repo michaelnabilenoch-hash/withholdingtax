@@ -192,40 +192,66 @@ def filter_year_and_date(sales_df, tax_date, tax_year, tax_month):
     
     return sales_df[mask_year & mask_date]
 
-def extended_subset_search(cand, targets, max_invoices=50, max_nodes=200000):
-    if not targets: return None
+def extended_subset_search(cand, targets, max_invoices=25, max_nodes=200000):
+    """
+    يحاول إيجاد مجموعة من الفواتير (أي عدد) مجموعها قريب من أحد الـ targets
+    مع حدود max_invoices (أقصى عدد فواتير نجربه) و max_nodes (أقصى عُقد بحث)
+    """
+    if not targets:
+        return None
+
     max_t, min_t = max(targets), min(targets)
-    
-    cand = cand.head(max_invoices).sort_values("net_amount", ascending=False)
+
+    # نقتصر على أول max_invoices فاتورة بعد الترتيب تنازلي بالقيمة
+    cand = cand.sort_values("net_amount", ascending=False).head(max_invoices)
+
     rows = list(cand.itertuples(index=False))
     n = len(rows)
-    if n == 0: return None
-    
+    if n == 0:
+        return None
+
     amounts = [r.net_amount for r in rows]
+
+    # suffix sums علشان نعرف أقصى ما يمكن إضافته في الفروع القادمة (للقص pruning)
     suffix = [0.0] * (n + 1)
     for i in range(n - 1, -1, -1):
         suffix[i] = suffix[i + 1] + amounts[i]
-    
+
     best = None
     best_diff = float("inf")
     nodes = 0
-    
+
     def dfs(i, cur_sum, chosen):
         nonlocal best, best_diff, nodes
         nodes += 1
-        if nodes > max_nodes or cur_sum > max_t * 1.05: return
-        if cur_sum + suffix[i] < min_t * 0.95: return
+
+        # حد أقصى لعُقد البحث
+        if nodes > max_nodes:
+            return
+
+        # لو تجاوزنا أعلى target بهامش 5% نوقف هذا الفرع
+        if cur_sum > max_t * 1.05:
+            return
+
+        # لو حتى لو أخذنا كل الباقي مش هنوصل لـ 95% من أقل target → الفرع ده ملوش لازمة
+        if cur_sum + suffix[i] < min_t * 0.95:
+            return
+
         if i == n:
             diff = min(abs(cur_sum - t) for t in targets)
             if diff <= 0.05 * max_t and diff < best_diff:
                 best_diff = diff
                 best = chosen[:]
             return
+
+        # 1) نجرب نأخذ الفاتورة الحالية
         chosen.append(i)
         dfs(i + 1, cur_sum + amounts[i], chosen)
         chosen.pop()
+
+        # 2) نجرب نتجاهل الفاتورة الحالية
         dfs(i + 1, cur_sum, chosen)
-    
+
     dfs(0, 0.0, [])
     return [rows[i] for i in best] if best else None
 
@@ -234,55 +260,59 @@ def extended_subset_search(cand, targets, max_invoices=50, max_nodes=200000):
 # ============================================================
 def find_best_match(tax_row, sales_df, used_invoices):
     tax_date = tax_row["date_parsed"]
-    if pd.isna(tax_date): return None
-    
+    if pd.isna(tax_date):
+        return None
+
     v_file, v_tax, v_mix = tax_row["v_file"], tax_row["v_tax"], tax_row["v_mix"]
     targets = [t for t in (v_file, v_tax, v_mix) if pd.notna(t) and t > 0]
-    if not targets: return None
-    
+    if not targets:
+        return None
+
+    # فواتير نفس الفترة
     cand = filter_year_and_date(sales_df, tax_date, tax_row["year"], tax_row["month"])
-    if cand.empty: return None
-    
+    if cand.empty:
+        return None
+
+    # استبعاد الفواتير اللي اتستخدمت قبل كده
     cand = cand[~cand[COL_INV].astype(str).isin(used_invoices)].copy()
-    if cand.empty: return None
-    
-    # 🔥 أولاً: التصفية حسب رقم التسجيل (إذا كان موجوداً)
+    if cand.empty:
+        return None
+
+    # تصفية برقم التسجيل
     tax_reg = str(tax_row.get("reg_clean", "")).strip()
     if tax_reg:
         cand_with_reg = cand[cand["reg_clean"] == tax_reg]
         if not cand_with_reg.empty:
-            cand = cand_with_reg.copy()  # نستخدم فقط الفواتير بنفس رقم التسجيل
-    
-    # لو بعد التصفية بقيش حاجة
+            cand = cand_with_reg.copy()
+
     if cand.empty:
         return None
 
+    # حساب تشابه الاسم
     cand["token_score"] = cand["tokens"].apply(lambda t: len(t & tax_row["tokens"]))
     cand["fuzzy"] = cand["name_norm"].apply(lambda s: fuzzy(s, tax_row["name_norm"]))
     cand = cand[(cand["token_score"] >= 1) | (cand["fuzzy"] >= 0.70)]
-    
-    if cand.empty: return None
-    
+    if cand.empty:
+        return None
+
     def within_absolute(val, max_diff=5.0):
         return any(abs(val - t) <= max_diff for t in targets)
-    
+
     def within_pct(val, pct=0.05):
         return any(abs(val - t) <= pct * t for t in targets)
-    
+
     cand["value_dist"] = cand["net_amount"].apply(
         lambda x: min(abs(x - t) for t in targets)
     )
-    
-    # 🔥 إضافة أولوية لتطابق رقم التسجيل
     cand["reg_match"] = (cand["reg_clean"] == tax_reg) & (tax_reg != "")
-    
+
+    # ترتيب المرشحين
     cand = cand.sort_values(
-        by=["reg_match", "value_dist", "token_score", "fuzzy"], 
-        ascending=[False, True, False, False]  # رقم التسجيل له الأولوية
+        by=["reg_match", "value_dist", "token_score", "fuzzy"],
+        ascending=[False, True, False, False]
     )
 
-    # 🆕 (1) تجميع كل فواتير نفس رقم التسجيل في الفترة
-    # إذا كان في رقم تسجيل، نجرب الأول: هل مجموع كل الفواتير المرشحة ≈ مبلغ الخصم؟
+    # 🆕 (0) لو فيه رقم تسجيل: جرّب جمع كل الفواتير لنفس الرقم مرة واحدة
     if tax_reg and not cand.empty:
         total_reg = cand["net_amount"].sum()
         if within_absolute(total_reg, 5.0) or within_pct(total_reg):
@@ -291,10 +321,10 @@ def find_best_match(tax_row, sales_df, used_invoices):
             dates = cand["pos_date"].astype(str).tolist()
             has_ret = cand["has_return"].any()
             return invs, years, dates, float(total_reg), has_ret
-    
-    # 1. فاتورة واحدة متطابقة (≤5 جنيه)
+
+    # 1️⃣ فاتورة واحدة
     for _, r in cand.head(100).iterrows():
-        if within_absolute(r["net_amount"], max_diff=5.0):
+        if within_absolute(r["net_amount"], max_diff=5.0) or within_pct(r["net_amount"]):
             return (
                 [str(r[COL_INV])],
                 [str(r["year"])],
@@ -302,57 +332,50 @@ def find_best_match(tax_row, sales_df, used_invoices):
                 float(r["net_amount"]),
                 r["has_return"],
             )
-    
-    # 2. فاتورة واحدة 5%
-    for _, r in cand.head(50).iterrows():
-        if within_pct(r["net_amount"]):
-            return (
-                [str(r[COL_INV])],
-                [str(r["year"])],
-                [str(r["pos_date"])],
-                float(r["net_amount"]),
-                r["has_return"],
-            )
-    
-    # 3. مجموع 2 فواتير
+
+    # 2️⃣ مجموع 2 فواتير
     for combo in combinations(cand.head(60).itertuples(index=False), 2):
         total = sum(r.net_amount for r in combo)
-        if not (within_absolute(total, 5.0) or within_pct(total)): 
+        if not (within_absolute(total, 5.0) or within_pct(total)):
             continue
         invs = [str(r._asdict()[COL_INV]) for r in combo]
-        if len(set(invs)) != len(invs): 
+        if len(set(invs)) != len(invs):
             continue
         years = [str(r.year) for r in combo]
         dates = [str(r.pos_date) for r in combo]
         ret = any(r.has_return for r in combo)
         return invs, years, dates, float(total), ret
-    
-    # 4. مجموع 3 فواتير
+
+    # 3️⃣ مجموع 3 فواتير
     for combo in combinations(cand.head(60).itertuples(index=False), 3):
         total = sum(r.net_amount for r in combo)
-        if not within_pct(total): 
+        if not within_pct(total):
             continue
         invs = [str(r._asdict()[COL_INV]) for r in combo]
-        if len(set(invs)) != len(invs): 
+        if len(set(invs)) != len(invs):
             continue
         years = [str(r.year) for r in combo]
         dates = [str(r.pos_date) for r in combo]
         ret = any(r.has_return for r in combo)
         return invs, years, dates, float(total), ret
-    
-    # 🆕 (2) بحث موسّع للمجموعات الأكبر من 3 فواتير
-    # بدون شرط مبلغ 50,000 – لكن مع التحكم في عدد الفواتير لتقليل التعقيد
-    if len(cand) <= 15:  # تقدر تزود/تقلل الرقم حسب حجم الداتا
-        ext = extended_subset_search(cand, targets, max_invoices=50, max_nodes=200000)
-        if ext:
-            total = sum(r.net_amount for r in ext)
-            if within_pct(total):
-                invs = [str(r._asdict()[COL_INV]) for r in ext]
-                years = [str(r.year) for r in ext]
-                dates = [str(r.pos_date) for r in ext]
-                ret = any(r.has_return for r in ext)
-                return invs, years, dates, float(total), ret
-    
+
+    # 4️⃣ بحث عام لأي عدد فواتير (4 فأكثر) مع حدود منطقية
+    max_invoices = 25  # تقدر تزودها لـ 30 لو بياناتك مش ضخمة
+    ext = extended_subset_search(
+        cand,
+        targets,
+        max_invoices=max_invoices,
+        max_nodes=200000
+    )
+    if ext:
+        total = sum(r.net_amount for r in ext)
+        if within_pct(total):
+            invs = [str(r._asdict()[COL_INV]) for r in ext]
+            years = [str(r.year) for r in ext]
+            dates = [str(r.pos_date) for r in ext]
+            ret = any(r.has_return for r in ext)
+            return invs, years, dates, float(total), ret
+
     return None
 
 def match_all_basic(sales_df, tax_df):

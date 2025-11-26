@@ -33,13 +33,16 @@ NEW_COLS = [
 # ============================================================
 STOPWORDS = {
     "شركة", "الشركة", "شركه", "الشركه", "وال", "لل", "ل", "مصر", "القاهرة",
-    "العالمية", "الدولية", "الجديدة", "مصنع", "الصناعات", "للتجارة", "تجارية"
+    "العالمية", "الدولية", "الجديدة", "مصنع", "الصناعات", "للتجارة", "تجارية",
+    "جروب", "للصناعات", "الغذائية", "اجرواندس", "والصناعات"
 }
 
 WORD_MAP = {
     "الصرف": "صرف", "والصرف": "صرف", "صرف الصحي": "صرف صحي",
     "الشرب": "شرب", "المياه": "مياه", "المياة": "مياه", "مياة": "مياه",
     "بسوهج": "بسوهاج", "بسوهـاج": "بسوهاج",
+    "الزراعى": "زراعي", "الزراعي": "زراعي", "للاستثمار": "استثمار",
+    "كليوباترا": "كليوباترا",  # نثبت الكلمات المهمة
 }
 
 def normalize_letters(text):
@@ -101,7 +104,7 @@ def prepare_sales(df_raw):
     ).reset_index()
     
     grouped = grouped[grouped["net_amount"] > 0]
-    grouped["date_parsed"], grouped["year"], grouped["month"] = parse_dates(grouped["pos_date"], dayfirst=False)
+    grouped["date_parsed"], grouped["year"], grouped["month"] = parse_dates(grouped["pos_date"], dayfirst=True)
     grouped["name_norm"] = grouped["name"].apply(normalize_name)
     grouped["tokens"] = grouped["name"].apply(tokenize)
     return grouped
@@ -126,16 +129,23 @@ def prepare_tax(df_raw):
     return df
 
 # ============================================================
-# فلاتر البحث
+# فلاتر البحث - محسّن
 # ============================================================
 def filter_year_and_date(sales_df, tax_date, tax_year, tax_month):
+    """
+    فلتر موسّع: يبحث في السنة الحالية + السنتين اللي قبلها
+    لتغطية حالات التأخير في الإقرار
+    """
     if tax_year == 0 or pd.isna(tax_date):
         return sales_df.iloc[0:0]
-    if tax_month in [1, 2, 3]:
-        mask_year = (sales_df["year"] == tax_year) | ((sales_df["year"] == tax_year - 1) & sales_df["month"].isin([10, 11, 12]))
-    else:
-        mask_year = (sales_df["year"] == tax_year)
+    
+    # نبحث في 3 سنوات: السنة الحالية والسنتين اللي قبلها
+    allowed_years = [tax_year, tax_year - 1, tax_year - 2]
+    mask_year = sales_df["year"].isin(allowed_years)
+    
+    # التاريخ لازم يكون قبل أو يساوي تاريخ كشف الخصم
     mask_date = (sales_df["date_parsed"] <= tax_date)
+    
     return sales_df[mask_year & mask_date]
 
 def extended_subset_search(cand, targets, max_invoices=50, max_nodes=200000):
@@ -176,7 +186,7 @@ def extended_subset_search(cand, targets, max_invoices=50, max_nodes=200000):
     return [rows[i] for i in best] if best else None
 
 # ============================================================
-# المطابقة الرئيسية - محسّنة
+# المطابقة الرئيسية - محسّنة جداً
 # ============================================================
 def find_best_match(tax_row, sales_df, used_invoices):
     tax_date = tax_row["date_parsed"]
@@ -186,32 +196,58 @@ def find_best_match(tax_row, sales_df, used_invoices):
     targets = [t for t in (v_file, v_tax, v_mix) if pd.notna(t) and t > 0]
     if not targets: return None
     
+    # فلتر موسّع للسنوات
     cand = filter_year_and_date(sales_df, tax_date, tax_row["year"], tax_row["month"])
     if cand.empty: return None
     
     cand = cand[~cand[COL_INV].astype(str).isin(used_invoices)].copy()
     if cand.empty: return None
     
-    # تسجيل التشابه
+    # حساب التشابه
     cand["token_score"] = cand["tokens"].apply(lambda t: len(t & tax_row["tokens"]))
     cand["fuzzy"] = cand["name_norm"].apply(lambda s: fuzzy(s, tax_row["name_norm"]))
     
-    # فلتر متوازن: نقبل كلمة واحدة مشتركة أو تشابه 85%
-    cand = cand[(cand["token_score"] >= 1) | (cand["fuzzy"] >= 0.85)]
+    # فلتر متوازن
+    cand = cand[(cand["token_score"] >= 1) | (cand["fuzzy"] >= 0.75)]
     if cand.empty: return None
     
     def within_pct(val, pct=0.05):
         return any(abs(val - t) <= pct * t for t in targets)
     
-    cand["value_dist"] = cand["net_amount"].apply(lambda x: min(abs(x - t) for t in targets))
-    cand = cand.sort_values(by=["value_dist", "fuzzy", "token_score"], ascending=[True, False, False])
+    def within_absolute(val, max_diff=1.0):
+        """للمبالغ المتطابقة تماماً (فرق ≤ 1 جنيه)"""
+        return any(abs(val - t) <= max_diff for t in targets)
     
-    # 1️⃣ فاتورة واحدة (الأولوية)
-    for _, r in cand.head(40).iterrows():
+    cand["value_dist"] = cand["net_amount"].apply(lambda x: min(abs(x - t) for t in targets))
+    
+    # ترتيب أذكى: الأقرب في المبلغ أولاً، ثم التشابه اللفظي
+    cand = cand.sort_values(
+        by=["value_dist", "token_score", "fuzzy"], 
+        ascending=[True, False, False]
+    )
+    
+    # 🔥 الأولوية الأولى: فاتورة واحدة متطابقة تماماً (فرق ≤ 1 جنيه)
+    for _, r in cand.head(100).iterrows():
+        if within_absolute(r["net_amount"], max_diff=1.0):
+            return [str(r[COL_INV])], [str(r["year"])], [str(r["pos_date"])], float(r["net_amount"]), r["has_return"]
+    
+    # 🎯 الأولوية الثانية: فاتورة واحدة في حدود 5%
+    for _, r in cand.head(50).iterrows():
         if within_pct(r["net_amount"]):
             return [str(r[COL_INV])], [str(r["year"])], [str(r["pos_date"])], float(r["net_amount"]), r["has_return"]
     
-    # 2️⃣ مجموع 2-3 فواتير
+    # ⚡ الأولوية الثالثة: مجموع 2 فواتير متطابق تماماً
+    for combo in combinations(cand.head(80).itertuples(index=False), 2):
+        total = sum(r.net_amount for r in combo)
+        if not within_absolute(total, max_diff=1.0): continue
+        invs = [str(r._asdict()[COL_INV]) for r in combo]
+        if len(set(invs)) != len(invs): continue
+        years = [str(r.year) for r in combo]
+        dates = [str(r.pos_date) for r in combo]
+        ret = any(r.has_return for r in combo)
+        return invs, years, dates, float(total), ret
+    
+    # 📊 الأولوية الرابعة: مجموع 2-3 فواتير في حدود 5%
     for n in [2, 3]:
         for combo in combinations(cand.head(80).itertuples(index=False), n):
             total = sum(r.net_amount for r in combo)
@@ -223,7 +259,7 @@ def find_best_match(tax_row, sales_df, used_invoices):
             ret = any(r.has_return for r in combo)
             return invs, years, dates, float(total), ret
     
-    # 3️⃣ بحث موسع للمبالغ الكبيرة
+    # 🚀 الأولوية الخامسة: بحث موسع للمبالغ الكبيرة
     if max(targets) >= 100000:
         ext = extended_subset_search(cand, targets)
         if ext:
@@ -262,8 +298,14 @@ def match_all(sales_df, tax_df):
 # واجهة Streamlit
 # ============================================================
 st.set_page_config(page_title="مطابقة خصم المنبع 2025", layout="wide")
-st.title("🎯 مطابقة خصم المنبع - النسخة المحسنة")
-st.markdown("**✅ معدل نجاح أعلى | ⚡ أداء أفضل | 🔍 دقة محسّنة**")
+st.title("🎯 مطابقة خصم المنبع - النسخة الذهبية المحسنة")
+st.markdown("""
+**✨ التحسينات الجديدة:**
+- 🔍 بحث في 3 سنوات (بدلاً من سنة واحدة)
+- 🎯 أولوية للفواتير المتطابقة تماماً (فرق ≤ 1 جنيه)
+- ⚡ ترتيب أذكى حسب المبلغ أولاً
+- 📊 معالجة أفضل للأسماء المتشابهة
+""")
 
 c1, c2 = st.columns(2)
 with c1:
@@ -285,15 +327,26 @@ if st.button("🚀 ابدأ المطابقة الآن", type="primary"):
             final_df, ok, bad = match_all(sales_prepared, tax_prepared)
             
             success_rate = (ok/(ok+bad)*100) if (ok+bad) > 0 else 0
-            st.success(f"✅ تمت المطابقة: **{ok:,}** صف | ❌ غير مطابق: **{bad:,}** صف | 📈 نسبة النجاح: **{success_rate:.2f}%**")
+            
+            # عرض النتائج بطريقة جذابة
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("✅ المطابق", f"{ok:,}", delta="نجح")
+            with col2:
+                st.metric("❌ غير المطابق", f"{bad:,}", delta="للمراجعة")
+            with col3:
+                st.metric("📈 نسبة النجاح", f"{success_rate:.2f}%")
+            
+            st.divider()
             
             output = io.BytesIO()
             final_df.to_csv(output, index=False, encoding="utf-8-sig")
             st.download_button(
-                label="📥 تحميل الكشف الكامل",
+                label="📥 تحميل الكشف الكامل بعد المطابقة",
                 data=output.getvalue(),
-                file_name="كشف_مطابق_محسن.csv",
-                mime="text/csv"
+                file_name="كشف_مطابق_ذهبي.csv",
+                mime="text/csv",
+                use_container_width=True
             )
             
             unmatched = final_df[final_df[NEW_COLS[0]] == ""]
@@ -301,11 +354,12 @@ if st.button("🚀 ابدأ المطابقة الآن", type="primary"):
                 out2 = io.BytesIO()
                 unmatched.to_csv(out2, index=False, encoding="utf-8-sig")
                 st.download_button(
-                    label="📥 تحميل غير المطابق",
+                    label="📥 تحميل غير المطابق فقط (للمراجعة اليدوية)",
                     data=out2.getvalue(),
-                    file_name="غير_مطابق.csv",
-                    mime="text/csv"
+                    file_name="غير_مطابق_للمراجعة.csv",
+                    mime="text/csv",
+                    use_container_width=True
                 )
 
 st.markdown("---")
-st.caption("💼 محاسب قانوني: مايكل نبيل | نسخة محسّنة 2025")
+st.caption("💼 تطوير: محاسب قانوني مايكل نبيل | 🚀 النسخة الذهبية 2025")

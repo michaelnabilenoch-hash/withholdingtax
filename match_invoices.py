@@ -96,8 +96,6 @@ def parse_dates(series, dayfirst):
 def prepare_sales(df_raw):
     df = df_raw.copy()
     df["amt"] = df[COL_AMOUNT].apply(to_num)
-    df_pos = df[df["amt"] > 0]
-    df_neg = df[df["amt"] < 0]
 
     grouped = df.groupby(COL_INV).agg(
         net_amount=("amt", "sum"),
@@ -107,7 +105,13 @@ def prepare_sales(df_raw):
     ).reset_index()
 
     grouped = grouped[grouped["net_amount"] > 0]
-    grouped["date_parsed"], grouped["year"], grouped["month"] = parse_dates(grouped["pos_date"], dayfirst=False)
+
+    # ✅ هنا التعديل المهم
+    grouped["date_parsed"], grouped["year"], grouped["month"] = parse_dates(
+        grouped["pos_date"],
+        dayfirst=True,      # بدلاً من False
+    )
+
     grouped["name_norm"] = grouped["name"].apply(normalize_name)
     grouped["tokens"] = grouped["name"].apply(tokenize)
     return grouped
@@ -194,57 +198,108 @@ def extended_subset_search(cand, v_file, v_tax, v_mix, max_invoices=50, max_node
 # ============================================================
 def find_best_match(tax_row, sales_df, used_invoices):
     tax_date = tax_row["date_parsed"]
-    if pd.isna(tax_date): return None
+    if pd.isna(tax_date):
+        return None
 
     v_file = tax_row["v_file"]
     v_tax = tax_row["v_tax"]
     v_mix = tax_row["v_mix"]
 
+    # المرشحين حسب السنة والتاريخ
     cand = filter_year_and_date(sales_df, tax_date, tax_row["year"], tax_row["month"])
-    if cand.empty: return None
+    if cand.empty:
+        return None
 
+    # استبعاد الفواتير اللي اتاستخدمت قبل كده
     cand = cand[~cand[COL_INV].astype(str).isin(used_invoices)]
-    if cand.empty: return None
+    if cand.empty:
+        return None
 
     cand = cand.copy()
     cand["token_score"] = cand["tokens"].apply(lambda t: len(t & tax_row["tokens"]))
     cand["fuzzy"] = cand["name_norm"].apply(lambda s: fuzzy(s, tax_row["name_norm"]))
     cand = cand[(cand["token_score"] >= 1) | (cand["fuzzy"] >= 0.85)]
-    if cand.empty: return None
+    if cand.empty:
+        return None
 
-    cand["value_dist"] = cand["net_amount"].apply(lambda x: min(abs(x - t) for t in (v_file, v_tax, v_mix) if pd.notna(t)))
-    cand = cand.sort_values(by=["value_dist", "fuzzy", "token_score"], ascending=[True, False, False])
+    targets = [t for t in (v_file, v_tax, v_mix) if pd.notna(t) and t > 0]
+    if not targets:
+        return None
 
-    def within_5pct(val):
-        for t in (v_file, v_tax, v_mix):
-            if pd.notna(t) and t > 0 and abs(val - t) <= 0.05 * t:
+    def value_dist(val):
+        return min(abs(val - t) for t in targets)
+
+    def within_pct(val, pct=0.05):
+        for t in targets:
+            if abs(val - t) <= pct * t:
                 return True
         return False
 
-    # 1. فاتورة واحدة
-    for _, r in cand.head(40).iterrows():
-        if within_5pct(r["net_amount"]):
-            return [str(r[COL_INV])], [str(r["year"])], [str(r["pos_date"])], float(r["net_amount"]), r["has_return"]
+    # نحسب المسافة عشان الترتيب
+    cand["value_dist"] = cand["net_amount"].apply(value_dist)
+    cand = cand.sort_values(by=["value_dist", "fuzzy", "token_score"],
+                            ascending=[True, False, False])
 
-    # 2. مجموع 2 أو 3 فواتير
+    # ============================================
+    # 1️⃣ الأول: نجرب مجموع 2 أو 3 فواتير قريب جدًا (فرق ≤ 1 جنيه)
+    # ============================================
+    best_combo = None
+    best_diff = float("inf")
+
     for n in [2, 3]:
         for combo in combinations(cand.head(80).itertuples(index=False), n):
             total = sum(r.net_amount for r in combo)
-            if not within_5pct(total): continue
+            diff = value_dist(total)
+            # هنا الشرط: المجموع قريب جدًا من المبلغ (مثلاً فرق ≤ 1 جنيه)
+            if diff <= 1.0 and diff < best_diff:
+                invs = [str(r._asdict()[COL_INV]) for r in combo]
+                # نتأكد مافيش فاتورة مكررة
+                if len(set(invs)) != len(invs):
+                    continue
+                best_combo = combo
+                best_diff = diff
+
+        # لو لقينا كومبو ممتاز في نفس n (2 أو 3) نرجّع على طول
+        if best_combo is not None:
+            invs = [str(r._asdict()[COL_INV]) for r in best_combo]
+            years = [str(r.year) for r in best_combo]
+            dates = [str(r.pos_date) for r in best_combo]
+            ret = any(r.has_return for r in best_combo)
+            total = sum(r.net_amount for r in best_combo)
+            return invs, years, dates, float(total), ret
+
+    # ============================================
+    # 2️⃣ بعد كده: فاتورة واحدة في حدود 5%
+    # ============================================
+    for _, r in cand.head(40).iterrows():
+        if within_pct(r["net_amount"], pct=0.05):
+            return [str(r[COL_INV])], [str(r["year"])], [str(r["pos_date"])], float(r["net_amount"]), r["has_return"]
+
+    # ============================================
+    # 3️⃣ لو مافيش: مجموع 2 أو 3 فواتير في حدود 5% (نفس الطريقة القديمة)
+    # ============================================
+    for n in [2, 3]:
+        for combo in combinations(cand.head(80).itertuples(index=False), n):
+            total = sum(r.net_amount for r in combo)
+            if not within_pct(total, pct=0.05):
+                continue
             invs = [str(r._asdict()[COL_INV]) for r in combo]
-            if len(set(invs)) != len(invs): continue
+            if len(set(invs)) != len(invs):
+                continue
             years = [str(r.year) for r in combo]
             dates = [str(r.pos_date) for r in combo]
             ret = any(r.has_return for r in combo)
             return invs, years, dates, float(total), ret
 
-    # 3. مجموع كبير (أكتر من 100 ألف)
+    # ============================================
+    # 4️⃣ البحث الموسّع للمبالغ الكبيرة زي ما هو
+    # ============================================
     target = v_mix if pd.notna(v_mix) else (v_tax if pd.notna(v_tax) else v_file)
     if pd.notna(target) and target >= 100000:
         ext = extended_subset_search(cand, v_file, v_tax, v_mix)
         if ext:
             total = sum(r.net_amount for r in ext)
-            if within_5pct(total):
+            if within_pct(total, pct=0.05):
                 invs = [str(r._asdict()[COL_INV]) for r in ext]
                 years = [str(r.year) for r in ext]
                 dates = [str(r.pos_date) for r in ext]

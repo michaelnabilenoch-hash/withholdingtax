@@ -13,12 +13,14 @@ COL_INV = "فواتير"
 COL_DATE = "التاريخ"
 COL_NAME = "اسم الشركة"
 COL_AMOUNT = "صافى المبيعات"
+COL_REG = "رقم التسجيل"  # رقم التسجيل الضريبي
 
 COL_TAX_NAME = "اسم الجهة"
 COL_TAX_AMOUNT = "القيمة الصافية للتعامل"
 COL_TAX_TAXED = "محصل لحساب الضريبه"
 COL_TAX_RATE = "نسبة الخصم"
 COL_TAX_DATE = "تاريخ التعامل"
+COL_TAX_REG = "رقم التسجيل"  # رقم التسجيل في كشف الخصم
 
 NEW_COLS = [
     "المطلوب رقم الفاتورة من ملف المبيعات",
@@ -84,6 +86,14 @@ def tokenize(s):
     norm = normalize_name(s)
     return set(w for w in norm.split() if w and w not in STOPWORDS)
 
+def normalize_reg_number(reg):
+    """تنظيف رقم التسجيل الضريبي"""
+    if pd.isna(reg): return ""
+    s = str(reg).strip()
+    # إزالة المسافات والشرطات
+    s = re.sub(r"[\s\-_]", "", s)
+    return s
+
 def fuzzy(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
@@ -107,6 +117,12 @@ def prepare_sales(df_raw):
     df = df_raw.copy()
     df["amt"] = df[COL_AMOUNT].apply(to_num)
     
+    # التعامل مع رقم التسجيل (اختياري)
+    if COL_REG in df.columns:
+        df["reg_clean"] = df[COL_REG].apply(normalize_reg_number)
+    else:
+        df["reg_clean"] = ""
+    
     grouped = df.groupby(COL_INV).agg(
         net_amount=("amt", "sum"),
         pos_date=(
@@ -116,6 +132,7 @@ def prepare_sales(df_raw):
         ),
         has_return=("amt", lambda s: any(s < 0)),
         name=(COL_NAME, "first"),
+        reg_clean=("reg_clean", "first"),  # إضافة رقم التسجيل
     ).reset_index()
     
     grouped = grouped[grouped["net_amount"] > 0]
@@ -133,6 +150,12 @@ def prepare_tax(df_raw):
     df = df_raw.copy()
     df["v_file"] = df[COL_TAX_AMOUNT].apply(to_num)
     df["v_tax_paid"] = df[COL_TAX_TAXED].apply(to_num)
+    
+    # التعامل مع رقم التسجيل (اختياري)
+    if COL_TAX_REG in df.columns:
+        df["reg_clean"] = df[COL_TAX_REG].apply(normalize_reg_number)
+    else:
+        df["reg_clean"] = ""
     
     def rate_to_float(x):
         try:
@@ -223,6 +246,13 @@ def find_best_match(tax_row, sales_df, used_invoices):
     cand = cand[~cand[COL_INV].astype(str).isin(used_invoices)].copy()
     if cand.empty: return None
     
+    # 🔥 أولاً: التصفية حسب رقم التسجيل (إذا كان موجوداً)
+    tax_reg = str(tax_row.get("reg_clean", "")).strip()
+    if tax_reg:
+        cand_with_reg = cand[cand["reg_clean"] == tax_reg]
+        if not cand_with_reg.empty:
+            cand = cand_with_reg.copy()  # نستخدم فقط الفواتير بنفس رقم التسجيل
+    
     cand["token_score"] = cand["tokens"].apply(lambda t: len(t & tax_row["tokens"]))
     cand["fuzzy"] = cand["name_norm"].apply(lambda s: fuzzy(s, tax_row["name_norm"]))
     cand = cand[(cand["token_score"] >= 1) | (cand["fuzzy"] >= 0.70)]
@@ -238,9 +268,13 @@ def find_best_match(tax_row, sales_df, used_invoices):
     cand["value_dist"] = cand["net_amount"].apply(
         lambda x: min(abs(x - t) for t in targets)
     )
+    
+    # 🔥 إضافة أولوية لتطابق رقم التسجيل
+    cand["reg_match"] = (cand["reg_clean"] == tax_reg) & (tax_reg != "")
+    
     cand = cand.sort_values(
-        by=["value_dist", "token_score", "fuzzy"], 
-        ascending=[True, False, False]
+        by=["reg_match", "value_dist", "token_score", "fuzzy"], 
+        ascending=[False, True, False, False]  # رقم التسجيل له الأولوية
     )
     
     # 1. فاتورة واحدة متطابقة (≤5 جنيه)
@@ -416,6 +450,11 @@ with st.expander("📖 كيفية الاستخدام", expanded=True):
     - راجع الجداول وعدّل فيها
     - اضغط "متابعة المطابقة النهائية"
     - البرنامج يثبت التطابقات المعتمدة ويكمل الباقي
+    
+    ### 🆕 ميزة جديدة: رقم التسجيل الضريبي
+    - إذا كان ملف المبيعات وكشف الخصم يحتويان على عمود **"رقم التسجيل"**
+    - البرنامج سيعطي **أولوية قصوى** للفواتير بنفس رقم التسجيل
+    - هذا يحسّن الدقة بشكل كبير ويتجنب الأخطاء
     """)
 
 col1, col2 = st.columns(2)

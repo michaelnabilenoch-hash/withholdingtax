@@ -245,18 +245,140 @@ def find_best_match(tax_row, sales_df, used_invoices):
     if cand.empty:
         return None
 
+def find_best_match(tax_row, sales_df, used_invoices):
+    tax_date = tax_row["date_parsed"]
+    if pd.isna(tax_date):
+        return None
+
+    v_file = tax_row["v_file"]
+    v_tax = tax_row["v_tax"]
+    v_mix = tax_row["v_mix"]
+
+    # المرشحين حسب السنة والتاريخ
+    cand = filter_year_and_date(sales_df, tax_date, tax_row["year"], tax_row["month"])
+    if cand.empty:
+        return None
+
+    # استبعاد الفواتير اللي اتاستخدمت قبل كده
+    cand = cand[~cand[COL_INV].astype(str).isin(used_invoices)]
+    if cand.empty:
+        return None
+
     cand = cand.copy()
     cand["token_score"] = cand["tokens"].apply(lambda t: len(t & tax_row["tokens"]))
     cand["fuzzy"] = cand["name_norm"].apply(lambda s: fuzzy(s, tax_row["name_norm"]))
 
-    # تشديد المطابقة بالاسم لتفادي خلط الشركات
-    cand = cand[(cand["token_score"] >= 2) | (cand["fuzzy"] >= 0.9)]
-    if cand.empty:
-        return None
+    # 1) فلتر مشدّد: اسمين شبه بعض بجد
+    strict = cand[(cand["token_score"] >= 2) | (cand["fuzzy"] >= 0.9)]
 
+    if not strict.empty:
+        cand = strict.copy()
+    else:
+        # 2) لو مفيش ولا حاجة، ندي فرصة لأسماء alias مختصرة (كلمة واحدة)
+        alias = cand[
+            (cand["token_score"] >= 1) &
+            (cand["tokens"].apply(len) == 1)
+        ]
+        if alias.empty:
+            return None
+        cand = alias.copy()
+
+    # 👈 مهم: من هنا وطالع برّه الـ else، على نفس مستوى cand = alias.copy()
     targets = [t for t in (v_file, v_tax, v_mix) if pd.notna(t) and t > 0]
     if not targets:
         return None
+
+    def value_dist(val):
+        return min(abs(val - t) for t in targets)
+
+    def within_pct(val, pct=0.05):
+        for t in targets:
+            if abs(val - t) <= pct * t:
+                return True
+        return False
+
+    # نحسب المسافة عشان الترتيب
+    cand["value_dist"] = cand["net_amount"].apply(value_dist)
+    cand = cand.sort_values(
+        by=["value_dist", "fuzzy", "token_score"],
+        ascending=[True, False, False],
+    )
+
+    # ============================================
+    # 1️⃣ الأول: مجموع 2 أو 3 فواتير قريب جدًا (فرق ≤ 1 جنيه)
+    # ============================================
+    best_combo = None
+    best_diff = float("inf")
+
+    for n in [2, 3]:
+        for combo in combinations(cand.head(80).itertuples(index=False), n):
+            total = sum(r.net_amount for r in combo)
+            diff = value_dist(total)
+            if diff <= 1.0 and diff < best_diff:
+                invs = [str(r._asdict()[COL_INV]) for r in combo]
+                if len(set(invs)) != len(invs):
+                    continue
+                best_combo = combo
+                best_diff = diff
+
+        if best_combo is not None:
+            invs = [str(r._asdict()[COL_INV]) for r in best_combo]
+            years = [str(r.year) for r in best_combo]
+            dates = [str(r.pos_date) for r in best_combo]
+            ret = any(r.has_return for r in best_combo)
+            total = sum(r.net_amount for r in best_combo)
+            return invs, years, dates, float(total), ret
+
+    # ============================================
+    # 2️⃣ بعد كده: فاتورة واحدة في حدود 5%
+    # ============================================
+    for _, r in cand.head(40).iterrows():
+        if within_pct(r["net_amount"], pct=0.05):
+            return (
+                [str(r[COL_INV])],
+                [str(r["year"])],
+                [str(r["pos_date"])],
+                float(r["net_amount"]),
+                r["has_return"],
+            )
+
+    # ============================================
+    # 3️⃣ لو مافيش: مجموع 2 أو 3 فواتير في حدود 5%
+    # ============================================
+    for n in [2, 3]:
+        for combo in combinations(cand.head(80).itertuples(index=False), n):
+            total = sum(r.net_amount for r in combo)
+            if not within_pct(total, pct=0.05):
+                continue
+            invs = [str(r._asdict()[COL_INV]) for r in combo]
+            if len(set(invs)) != len(invs):
+                continue
+            years = [str(r.year) for r in combo]
+            dates = [str(r.pos_date) for r in combo]
+            ret = any(r.has_return for r in combo)
+            return invs, years, dates, float(total), ret
+
+    # ============================================
+    # 4️⃣ بحث موسّع لأي مبلغ لو عدد الفواتير المرشحة قليل
+    # ============================================
+    if targets and len(cand) <= 25:
+        ext = extended_subset_search(
+            cand,
+            v_file,
+            v_tax,
+            v_mix,
+            max_invoices=min(len(cand), 25),
+        )
+        if ext:
+            total = sum(r.net_amount for r in ext)
+            if within_pct(total, pct=0.05):
+                invs = [str(r._asdict()[COL_INV]) for r in ext]
+                years = [str(r.year) for r in ext]
+                dates = [str(r.pos_date) for r in ext]
+                ret = any(r.has_return for r in ext)
+                return invs, years, dates, float(total), ret
+
+    return None
 
     def value_dist(val):
         return min(abs(val - t) for t in targets)

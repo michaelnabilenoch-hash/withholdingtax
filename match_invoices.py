@@ -36,7 +36,11 @@ NEW_COLS = [
 # ============================================================
 STOPWORDS = {
     "شركة", "الشركة", "شركه", "الشركه", "وال", "لل", "ل", "مصر", "القاهرة",
-    "العالمية", "الدولية", "الجديدة", "مصنع", "الصناعات", "للتجارة", "تجارية"
+    "العالمية", "الدولية", "الجديدة", "مصنع", "الصناعات", "للتجارة", "تجارية",
+    # إضافات مهمة تقلل خلط الشركات
+    "للصناعات", "صناعات", "للمنتجات", "منتجات",
+    "للمقاولات", "مقاولات", "للمرافق", "مرافق",
+    "للغزل", "غزل", "للاسمده", "اسمده", "للخدمات", "خدمات",
 }
 
 WORD_MAP = {
@@ -46,7 +50,8 @@ WORD_MAP = {
 }
 
 def normalize_letters(text):
-    if pd.isna(text): return ""
+    if pd.isna(text):
+        return ""
     s = str(text)
     s = re.sub(r"[أإآا]", "ا", s)
     s = re.sub(r"[ة]", "ه", s)
@@ -59,7 +64,8 @@ def remove_al_prefix(word):
     return word[2:] if word.startswith("ال") else word
 
 def normalize_name(s):
-    if pd.isna(s): return ""
+    if pd.isna(s):
+        return ""
     s = normalize_letters(s).lower()
     s = re.sub(r"[^ء-ي\s]", " ", s)
     words = [w for w in s.split() if w.strip()]
@@ -73,9 +79,17 @@ def normalize_name(s):
     final = re.sub(r"\s+", " ", final).strip()
     return final
 
+def strip_prefixes(word):
+    # نشيل البادئات الشائعة: وال، بال، لل، ال، ل
+    for pref in ("وال", "بال", "لل", "ال", "ل"):
+        if word.startswith(pref) and len(word) > len(pref) + 1:
+            return word[len(pref):]
+    return word
+
 def tokenize(s):
     norm = normalize_name(s)
-    return set(w for w in norm.split() if w and w not in STOPWORDS)
+    words = [strip_prefixes(w) for w in norm.split() if w.strip()]
+    return set(w for w in words if w and w not in STOPWORDS)
 
 def fuzzy(a, b):
     return SequenceMatcher(None, a, b).ratio()
@@ -106,10 +120,10 @@ def prepare_sales(df_raw):
 
     grouped = grouped[grouped["net_amount"] > 0]
 
-    # ✅ هنا التعديل المهم
+    # قراءة تواريخ المبيعات بصيغة يوم/شهر/سنة
     grouped["date_parsed"], grouped["year"], grouped["month"] = parse_dates(
         grouped["pos_date"],
-        dayfirst=True,      # بدلاً من False
+        dayfirst=True,
     )
 
     grouped["name_norm"] = grouped["name"].apply(normalize_name)
@@ -129,9 +143,15 @@ def prepare_tax(df_raw):
             return float(str(x).replace("%", "").strip()) / 100.0
         except:
             return np.nan
+
     df["rate"] = df[COL_TAX_RATE].apply(rate_to_float)
 
-    df["v_tax"] = df.apply(lambda r: r["v_tax_paid"] / r["rate"] if pd.notna(r["v_tax_paid"]) and pd.notna(r["rate"]) and r["rate"] > 0 else np.nan, axis=1)
+    df["v_tax"] = df.apply(
+        lambda r: r["v_tax_paid"] / r["rate"]
+        if pd.notna(r["v_tax_paid"]) and pd.notna(r["rate"]) and r["rate"] > 0
+        else np.nan,
+        axis=1,
+    )
     df["v_mix"] = df[["v_file", "v_tax"]].mean(axis=1, skipna=True)
     df["date_parsed"], df["year"], df["month"] = parse_dates(df[COL_TAX_DATE], dayfirst=True)
     df["name_norm"] = df[COL_TAX_NAME].apply(normalize_name)
@@ -145,23 +165,30 @@ def filter_year_and_date(sales_df, tax_date, tax_year, tax_month):
     if tax_year == 0 or pd.isna(tax_date):
         return sales_df.iloc[0:0]
     if tax_month in [1, 2, 3]:
-        mask_year = (sales_df["year"] == tax_year) | ((sales_df["year"] == tax_year - 1) & sales_df["month"].isin([10, 11, 12]))
+        mask_year = (sales_df["year"] == tax_year) | (
+            (sales_df["year"] == tax_year - 1) & sales_df["month"].isin([10, 11, 12])
+        )
     else:
         mask_year = (sales_df["year"] == tax_year)
     mask_date = (sales_df["date_parsed"] <= tax_date)
     return sales_df[mask_year & mask_date]
 
 # ============================================================
-# البحث الموسع (للمبالغ الكبيرة)
+# البحث الموسع (مجموع فواتير)
 # ============================================================
 def extended_subset_search(cand, v_file, v_tax, v_mix, max_invoices=50, max_nodes=200000):
     targets = [t for t in (v_file, v_tax, v_mix) if pd.notna(t) and t > 0]
-    if not targets: return None
+    if not targets:
+        return None
+
     max_t, min_t = max(targets), min(targets)
+
     cand = cand.head(max_invoices).sort_values("net_amount", ascending=False)
     rows = list(cand.itertuples(index=False))
     n = len(rows)
-    if n == 0: return None
+    if n == 0:
+        return None
+
     amounts = [r.net_amount for r in rows]
     suffix = [0.0] * (n + 1)
     for i in range(n - 1, -1, -1):
@@ -174,9 +201,12 @@ def extended_subset_search(cand, v_file, v_tax, v_mix, max_invoices=50, max_node
     def dfs(i, cur_sum, chosen):
         nonlocal best, best_diff, nodes
         nodes += 1
-        if nodes > max_nodes: return
-        if cur_sum > max_t * 1.05: return
-        if cur_sum + suffix[i] < min_t * 0.95: return
+        if nodes > max_nodes:
+            return
+        if cur_sum > max_t * 1.05:
+            return
+        if cur_sum + suffix[i] < min_t * 0.95:
+            return
         if i == n:
             diff = min(abs(cur_sum - t) for t in targets)
             if diff <= 0.05 * max_t and diff < best_diff:
@@ -218,7 +248,9 @@ def find_best_match(tax_row, sales_df, used_invoices):
     cand = cand.copy()
     cand["token_score"] = cand["tokens"].apply(lambda t: len(t & tax_row["tokens"]))
     cand["fuzzy"] = cand["name_norm"].apply(lambda s: fuzzy(s, tax_row["name_norm"]))
-    cand = cand[(cand["token_score"] >= 1) | (cand["fuzzy"] >= 0.85)]
+
+    # تشديد المطابقة بالاسم لتفادي خلط الشركات
+    cand = cand[(cand["token_score"] >= 2) | (cand["fuzzy"] >= 0.9)]
     if cand.empty:
         return None
 
@@ -237,11 +269,13 @@ def find_best_match(tax_row, sales_df, used_invoices):
 
     # نحسب المسافة عشان الترتيب
     cand["value_dist"] = cand["net_amount"].apply(value_dist)
-    cand = cand.sort_values(by=["value_dist", "fuzzy", "token_score"],
-                            ascending=[True, False, False])
+    cand = cand.sort_values(
+        by=["value_dist", "fuzzy", "token_score"],
+        ascending=[True, False, False],
+    )
 
     # ============================================
-    # 1️⃣ الأول: نجرب مجموع 2 أو 3 فواتير قريب جدًا (فرق ≤ 1 جنيه)
+    # 1️⃣ الأول: مجموع 2 أو 3 فواتير قريب جدًا (فرق ≤ 1 جنيه)
     # ============================================
     best_combo = None
     best_diff = float("inf")
@@ -250,16 +284,13 @@ def find_best_match(tax_row, sales_df, used_invoices):
         for combo in combinations(cand.head(80).itertuples(index=False), n):
             total = sum(r.net_amount for r in combo)
             diff = value_dist(total)
-            # هنا الشرط: المجموع قريب جدًا من المبلغ (مثلاً فرق ≤ 1 جنيه)
             if diff <= 1.0 and diff < best_diff:
                 invs = [str(r._asdict()[COL_INV]) for r in combo]
-                # نتأكد مافيش فاتورة مكررة
                 if len(set(invs)) != len(invs):
                     continue
                 best_combo = combo
                 best_diff = diff
 
-        # لو لقينا كومبو ممتاز في نفس n (2 أو 3) نرجّع على طول
         if best_combo is not None:
             invs = [str(r._asdict()[COL_INV]) for r in best_combo]
             years = [str(r.year) for r in best_combo]
@@ -273,10 +304,16 @@ def find_best_match(tax_row, sales_df, used_invoices):
     # ============================================
     for _, r in cand.head(40).iterrows():
         if within_pct(r["net_amount"], pct=0.05):
-            return [str(r[COL_INV])], [str(r["year"])], [str(r["pos_date"])], float(r["net_amount"]), r["has_return"]
+            return (
+                [str(r[COL_INV])],
+                [str(r["year"])],
+                [str(r["pos_date"])],
+                float(r["net_amount"]),
+                r["has_return"],
+            )
 
     # ============================================
-    # 3️⃣ لو مافيش: مجموع 2 أو 3 فواتير في حدود 5% (نفس الطريقة القديمة)
+    # 3️⃣ لو مافيش: مجموع 2 أو 3 فواتير في حدود 5%
     # ============================================
     for n in [2, 3]:
         for combo in combinations(cand.head(80).itertuples(index=False), n):
@@ -292,11 +329,17 @@ def find_best_match(tax_row, sales_df, used_invoices):
             return invs, years, dates, float(total), ret
 
     # ============================================
-    # 4️⃣ البحث الموسّع للمبالغ الكبيرة زي ما هو
+    # 4️⃣ بحث موسّع لأي مبلغ لو عدد الفواتير المرشحة قليل
+    #    (مفيد لحالات زي تكميل فيها 5-10 فواتير لنفس الجهة)
     # ============================================
-    target = v_mix if pd.notna(v_mix) else (v_tax if pd.notna(v_tax) else v_file)
-    if pd.notna(target) and target >= 100000:
-        ext = extended_subset_search(cand, v_file, v_tax, v_mix)
+    if targets and len(cand) <= 25:
+        ext = extended_subset_search(
+            cand,
+            v_file,
+            v_tax,
+            v_mix,
+            max_invoices=min(len(cand), 25),
+        )
         if ext:
             total = sum(r.net_amount for r in ext)
             if within_pct(total, pct=0.05):
@@ -358,7 +401,9 @@ if st.button("ابدأ المطابقة الآن", type="primary"):
 
             final_df, ok, bad = match_all(sales_prepared, tax_prepared)
 
-            st.success(f"تمت المطابقة: {ok:,} صف | غير مطابق: {bad:,} صف | نسبة النجاح: {(ok/(ok+bad)*100):.2f}%")
+            st.success(
+                f"تمت المطابقة: {ok:,} صف | غير مطابق: {bad:,} صف | نسبة النجاح: {(ok/(ok+bad)*100):.2f}%"
+            )
 
             # ملف كامل
             output = io.BytesIO()
@@ -367,7 +412,7 @@ if st.button("ابدأ المطابقة الآن", type="primary"):
                 label="تحميل الكشف الكامل بعد المطابقة",
                 data=output.getvalue(),
                 file_name="كشف_خصم_المنبع_مطابق_نهائي.csv",
-                mime="text/csv"
+                mime="text/csv",
             )
 
             # غير المطابق فقط
@@ -379,8 +424,8 @@ if st.button("ابدأ المطابقة الآن", type="primary"):
                     label="تحميل غير المطابق فقط (للمراجعة)",
                     data=out2.getvalue(),
                     file_name="غير_مطابق_للمراجعة.csv",
-                    mime="text/csv"
+                    mime="text/csv",
                 )
 
 st.markdown("---")
-st.caption("تم التطوير بواسطة محاسب قانونى  : مايكل نبيل ")
+st.caption("تم التطوير بواسطة محاسب قانونى : مايكل نبيل")
